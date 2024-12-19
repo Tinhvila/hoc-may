@@ -2,245 +2,6 @@ import numpy as np
 import pandas as pd
 import os
 import re
-import copy
-import pickle
-from sklearn.base import clone
-from sklearn.metrics import cohen_kappa_score
-from sklearn.model_selection import StratifiedKFold
-from scipy.optimize import minimize
-from concurrent.futures import ThreadPoolExecutor
-from tqdm import tqdm
-import polars as pl
-import polars.selectors as cs
-import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator, FormatStrFormatter, PercentFormatter
-import seaborn as sns
-
-from sklearn.preprocessing import StandardScaler
-import matplotlib.pyplot as plt
-from keras.models import Model
-from keras.layers import Input, Dense
-from keras.optimizers import Adam
-import torch
-import torch.nn as nn
-import torch.optim as optim
-
-from colorama import Fore, Style
-from IPython.display import clear_output
-import warnings
-from lightgbm import LGBMRegressor
-from xgboost import XGBRegressor
-from catboost import CatBoostRegressor
-from sklearn.ensemble import VotingRegressor, RandomForestRegressor, GradientBoostingRegressor
-from sklearn.impute import SimpleImputer, KNNImputer
-from sklearn.pipeline import Pipeline
-
-import plotly.express as px
-
-warnings.filterwarnings('ignore')
-pd.options.display.max_columns = None
-train = pd.read_csv('/kaggle/input/child-mind-institute-problematic-internet-use/train.csv')
-test = pd.read_csv('/kaggle/input/child-mind-institute-problematic-internet-use/test.csv')
-sample = pd.read_csv('/kaggle/input/child-mind-institute-problematic-internet-use/sample_submission.csv')
-
-def process_file(filename, dirname):
-    df = pd.read_parquet(os.path.join(dirname, filename, 'part-0.parquet'))
-    df.drop('step', axis=1, inplace=True)
-    return df.describe().values.reshape(-1), filename.split('=')[1]
-
-def load_time_series(dirname) -> pd.DataFrame:
-    ids = os.listdir(dirname)
-    
-    with ThreadPoolExecutor() as executor:
-        results = list(tqdm(executor.map(lambda fname: process_file(fname, dirname), ids), total=len(ids)))
-    
-    stats, indexes = zip(*results)
-    
-    df = pd.DataFrame(stats, columns=[f"stat_{i}" for i in range(len(stats[0]))])
-    df['id'] = indexes
-    return df
-        
-train_ts = load_time_series("/kaggle/input/child-mind-institute-problematic-internet-use/series_train.parquet")
-test_ts = load_time_series("/kaggle/input/child-mind-institute-problematic-internet-use/series_test.parquet")
-
-time_series_cols = train_ts.columns.tolist()
-time_series_cols.remove("id")
-
-train = pd.merge(train, train_ts, how="left", on='id')
-test = pd.merge(test, test_ts, how="left", on='id')
-
-train = train.drop('id', axis=1)
-test = test.drop('id', axis=1)   
-
-featuresCols = ['Basic_Demos-Enroll_Season', 'Basic_Demos-Age', 'Basic_Demos-Sex',
-                'CGAS-Season', 'CGAS-CGAS_Score', 'Physical-Season', 'Physical-BMI',
-                'Physical-Height', 'Physical-Weight', 'Physical-Waist_Circumference',
-                'Physical-Diastolic_BP', 'Physical-HeartRate', 'Physical-Systolic_BP',
-                'Fitness_Endurance-Season', 'Fitness_Endurance-Max_Stage',
-                'Fitness_Endurance-Time_Mins', 'Fitness_Endurance-Time_Sec',
-                'FGC-Season', 'FGC-FGC_CU', 'FGC-FGC_CU_Zone', 'FGC-FGC_GSND',
-                'FGC-FGC_GSND_Zone', 'FGC-FGC_GSD', 'FGC-FGC_GSD_Zone', 'FGC-FGC_PU',
-                'FGC-FGC_PU_Zone', 'FGC-FGC_SRL', 'FGC-FGC_SRL_Zone', 'FGC-FGC_SRR',
-                'FGC-FGC_SRR_Zone', 'FGC-FGC_TL', 'FGC-FGC_TL_Zone', 'BIA-Season',
-                'BIA-BIA_Activity_Level_num', 'BIA-BIA_BMC', 'BIA-BIA_BMI',
-                'BIA-BIA_BMR', 'BIA-BIA_DEE', 'BIA-BIA_ECW', 'BIA-BIA_FFM',
-                'BIA-BIA_FFMI', 'BIA-BIA_FMI', 'BIA-BIA_Fat', 'BIA-BIA_Frame_num',
-                'BIA-BIA_ICW', 'BIA-BIA_LDM', 'BIA-BIA_LST', 'BIA-BIA_SMM',
-                'BIA-BIA_TBW', 'PAQ_A-Season', 'PAQ_A-PAQ_A_Total', 'PAQ_C-Season',
-                'PAQ_C-PAQ_C_Total', 'SDS-Season', 'SDS-SDS_Total_Raw',
-                'SDS-SDS_Total_T', 'PreInt_EduHx-Season',
-                'PreInt_EduHx-computerinternet_hoursday', 'sii']
-
-featuresCols += time_series_cols
-
-train = train[featuresCols]
-train = train.dropna(subset='sii')
-
-cat_c = ['Basic_Demos-Enroll_Season', 'CGAS-Season', 'Physical-Season', 
-          'Fitness_Endurance-Season', 'FGC-Season', 'BIA-Season', 
-          'PAQ_A-Season', 'PAQ_C-Season', 'SDS-Season', 'PreInt_EduHx-Season']
-
-def update(df):
-    global cat_c
-    for c in cat_c: 
-        df[c] = df[c].fillna('Missing')
-        df[c] = df[c].astype('category')
-    return df
-        
-train = update(train)
-test = update(test)
-
-def create_mapping(column, dataset):
-    unique_values = dataset[column].unique()
-    return {value: idx for idx, value in enumerate(unique_values)}
-
-for col in cat_c:
-    mapping = create_mapping(col, train)
-    mappingTe = create_mapping(col, test)
-    
-    train[col] = train[col].replace(mapping).astype(int)
-    test[col] = test[col].replace(mappingTe).astype(int)
-
-def quadratic_weighted_kappa(y_true, y_pred):
-    return cohen_kappa_score(y_true, y_pred, weights='quadratic')
-
-def threshold_Rounder(oof_non_rounded, thresholds):
-    return np.where(oof_non_rounded < thresholds[0], 0,
-                    np.where(oof_non_rounded < thresholds[1], 1,
-                             np.where(oof_non_rounded < thresholds[2], 2, 3)))
-
-def evaluate_predictions(thresholds, y_true, oof_non_rounded):
-    rounded_p = threshold_Rounder(oof_non_rounded, thresholds)
-    return -quadratic_weighted_kappa(y_true, rounded_p)
-
-def TrainML(model_class, test_data):
-    X = train.drop(['sii'], axis=1)
-    y = train['sii']
-
-    SKF = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=SEED)
-    
-    train_S = []
-    test_S = []
-    
-    oof_non_rounded = np.zeros(len(y), dtype=float) 
-    oof_rounded = np.zeros(len(y), dtype=int) 
-    test_preds = np.zeros((len(test_data), n_splits))
-
-    for fold, (train_idx, test_idx) in enumerate(tqdm(SKF.split(X, y), desc="Training Folds", total=n_splits)):
-        X_train, X_val = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_val = y.iloc[train_idx], y.iloc[test_idx]
-
-        model = clone(model_class)
-        model.fit(X_train, y_train)
-
-        y_train_pred = model.predict(X_train)
-        y_val_pred = model.predict(X_val)
-
-        oof_non_rounded[test_idx] = y_val_pred
-        y_val_pred_rounded = y_val_pred.round(0).astype(int)
-        oof_rounded[test_idx] = y_val_pred_rounded
-
-        train_kappa = quadratic_weighted_kappa(y_train, y_train_pred.round(0).astype(int))
-        val_kappa = quadratic_weighted_kappa(y_val, y_val_pred_rounded)
-
-        train_S.append(train_kappa)
-        test_S.append(val_kappa)
-        
-        test_preds[:, fold] = model.predict(test_data)
-        
-        print(f"Fold {fold+1} - Train QWK: {train_kappa:.4f}, Validation QWK: {val_kappa:.4f}")
-        clear_output(wait=True)
-
-    print(f"Mean Train QWK --> {np.mean(train_S):.4f}")
-    print(f"Mean Validation QWK ---> {np.mean(test_S):.4f}")
-
-    KappaOPtimizer = minimize(evaluate_predictions,
-                              x0=[0.5, 1.5, 2.5], args=(y, oof_non_rounded), 
-                              method='Nelder-Mead')
-    assert KappaOPtimizer.success, "Optimization did not converge."
-    print('OPTIMIZED THRESHOLDS', KappaOPtimizer.x)
-    oof_tuned = threshold_Rounder(oof_non_rounded, KappaOPtimizer.x)
-    tKappa = quadratic_weighted_kappa(y, oof_tuned)
-
-    print(f"----> || Optimized QWK SCORE :: {Fore.CYAN}{Style.BRIGHT} {tKappa:.3f}{Style.RESET_ALL}")
-
-    tpm = test_preds.mean(axis=1)
-    tpTuned = threshold_Rounder(tpm, KappaOPtimizer.x)
-    
-    submission = pd.DataFrame({
-        'id': sample['id'],
-        'sii': tpTuned
-    })
-    optimized_thresholds = KappaOPtimizer.x
-    return submission, oof_tuned, oof_non_rounded, y, optimized_thresholds
-    SEED = 42
-n_splits = 5
-
-model = XGBRegressor(
-    learning_rate=0.05,
-    max_depth=6,
-    n_estimators=200,
-    subsample=0.8,
-    colsample_bytree = 0.8,
-    reg_alpha=1,
-    reg_lambda=5,
-    random_state=SEED
-)
-
-# we get out of fold predictions for further exploration
-submission, y_pred, y_pred_non_rounded, y_true, optimized_thresholds = TrainML(model, test)
-df_score_changes = []
-for y_new in range(4):
-    item = {'y_new': y_new}
-    score_pred_zero = quadratic_weighted_kappa(list(y_true) + [y_new], list(y_pred) + [0])
-    for pred_new in range(4):
-        score = quadratic_weighted_kappa(list(y_true) + [y_new], list(y_pred) + [pred_new])
-        item[f'pred_new={pred_new}'] = score - score_pred_zero
-    df_score_changes.append(item)
-
-df_score_changes = pd.DataFrame(df_score_changes)
-df_score_changes
-for t_idx in range(3):
-    df_plot = []
-    for t in np.arange(0.0, 3.0, 0.001):
-        thresholds = copy.copy(optimized_thresholds)
-        thresholds[t_idx] = t
-        score = -evaluate_predictions(thresholds, y_true, y_pred_non_rounded)
-        df_plot.append({f't_{t_idx}': t, 'score': score})
-    
-    df_plot = pd.DataFrame(df_plot)
-    fig = px.line(df_plot, x=f't_{t_idx}', y='score', title=f't_{t_idx}')
-    fig.show(renderer='iframe')
-# The threshold optimizer in the code appears to be finding a local maximum, not the global maximum
-print('optimized_thresholds score:', -evaluate_predictions(optimized_thresholds, y_true, y_pred_non_rounded))
-print('another thresholds score:', -evaluate_predictions([0.6264773 , 0.89171596, 1.64], y_true, y_pred_non_rounded))
-!pip -q install /kaggle/input/pytorchtabnet/pytorch_tabnet-4.1.0-py3-none-any.whl
-from pytorch_tabnet.tab_model import TabNetRegressor
-import torch
-import numpy as np
-import pandas as pd
-import os
-import re
 from sklearn.base import clone
 from sklearn.metrics import cohen_kappa_score
 from sklearn.model_selection import StratifiedKFold
@@ -283,6 +44,181 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
 seed_everything(2024)
+target_labels = ['None', 'Mild', 'Moderate', 'Severe']
+season_dtype = pl.Enum(['Spring', 'Summer', 'Fall', 'Winter'])
+
+train = (
+    pl.read_csv('/kaggle/input/child-mind-institute-problematic-internet-use/train.csv')
+    .with_columns(pl.col('^.*Season$').cast(season_dtype))
+)
+
+test = (
+    pl.read_csv('/kaggle/input/child-mind-institute-problematic-internet-use/test.csv')
+    .with_columns(pl.col('^.*Season$').cast(season_dtype))
+)
+
+train
+test
+supervised_usable = (
+    train
+    .filter(pl.col('sii').is_not_null())
+)
+
+missing_count = (
+    supervised_usable
+    .null_count()
+    .transpose(include_header=True,
+               header_name='feature',
+               column_names=['null_count'])
+    .sort('null_count', descending=True)
+    .with_columns((pl.col('null_count') / len(supervised_usable)).alias('null_ratio'))
+)
+plt.figure(figsize=(6, 15))
+plt.title(f'Missing values over the {len(supervised_usable)} samples which have a target')
+plt.barh(np.arange(len(missing_count)), missing_count.get_column('null_ratio'), color='coral', label='missing')
+plt.barh(np.arange(len(missing_count)), 
+         1 - missing_count.get_column('null_ratio'),
+         left=missing_count.get_column('null_ratio'),
+         color='darkseagreen', label='available')
+plt.yticks(np.arange(len(missing_count)), missing_count.get_column('feature'))
+plt.gca().xaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
+plt.xlim(0, 1)
+plt.legend()
+plt.show()
+print(train.select(pl.col('PCIAT-PCIAT_Total').is_null() == pl.col('sii').is_null()).to_series().mean())
+
+(train
+ .select(pl.col('PCIAT-PCIAT_Total'))
+ .group_by(train.get_column('sii'))
+ .agg(pl.col('PCIAT-PCIAT_Total').min().alias('PCIAT-PCIAT_Total min'),
+      pl.col('PCIAT-PCIAT_Total').max().alias('PCIAT-PCIAT_Total max'),
+      pl.col('PCIAT-PCIAT_Total').len().alias('count'))
+ .sort('sii')
+)
+print('Columns missing in test:')
+print([f for f in train.columns if f not in test.columns])
+vc = train.get_column('Basic_Demos-Enroll_Season').value_counts()
+plt.pie(vc.get_column('count'), labels=vc.get_column('Basic_Demos-Enroll_Season'))
+plt.title('Season of enrollment')
+plt.show()
+vc = train.get_column('Basic_Demos-Sex').value_counts()
+plt.pie(vc.get_column('count'), labels=['boys', 'girls'])
+plt.title('Sex of participant')
+plt.show()
+_, axs = plt.subplots(2, 1, sharex=True)
+for sex in range(2):
+    ax = axs.ravel()[sex]
+    vc = train.filter(pl.col('Basic_Demos-Sex') == sex).get_column('Basic_Demos-Age').value_counts()
+    ax.bar(vc.get_column('Basic_Demos-Age'),
+           vc.get_column('count'),
+           color=['lightblue', 'coral'][sex],
+           label=['boys', 'girls'][sex])
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.set_ylabel('count')
+    ax.legend()
+plt.suptitle('Age distribution')
+axs.ravel()[1].set_xlabel('years')
+plt.show()
+_, axs = plt.subplots(2, 1, sharex=True, sharey=True)
+for sex in range(2):
+    ax = axs.ravel()[sex]
+    vc = train.filter(pl.col('Basic_Demos-Sex') == sex).get_column('sii').value_counts()
+    ax.bar(vc.get_column('sii'),
+           vc.get_column('count') / vc.get_column('count').sum(),
+           color=['lightblue', 'coral'][sex],
+           label=['boys', 'girls'][sex])
+    ax.set_xticks(np.arange(4), target_labels)
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
+    ax.set_ylabel('count')
+    ax.legend()
+plt.suptitle('Target distribution')
+axs.ravel()[1].set_xlabel('Severity Impairment Index (sii)')
+plt.show()
+plt.figure(figsize=(14, 12))
+corr_matrix = supervised_usable.select([
+    'PCIAT-PCIAT_Total', 'Basic_Demos-Age', 'Basic_Demos-Sex', 'Physical-BMI', 
+    'Physical-Height', 'Physical-Weight', 'Physical-Waist_Circumference',
+    'Physical-Diastolic_BP', 'Physical-Systolic_BP', 'Physical-HeartRate',
+    'PreInt_EduHx-computerinternet_hoursday', 'SDS-SDS_Total_T', 'PAQ_A-PAQ_A_Total',
+    'PAQ_C-PAQ_C_Total', 'Fitness_Endurance-Max_Stage', 'Fitness_Endurance-Time_Mins','Fitness_Endurance-Time_Sec',
+    'FGC-FGC_CU', 'FGC-FGC_GSND','FGC-FGC_GSD','FGC-FGC_PU','FGC-FGC_SRL','FGC-FGC_SRR','FGC-FGC_TL','BIA-BIA_Activity_Level_num', 
+    'BIA-BIA_BMC', 'BIA-BIA_BMI', 'BIA-BIA_BMR', 'BIA-BIA_DEE', 'BIA-BIA_ECW', 'BIA-BIA_FFM',
+    'BIA-BIA_FFMI','BIA-BIA_FMI', 'BIA-BIA_Fat','BIA-BIA_Frame_num','BIA-BIA_ICW','BIA-BIA_LDM','BIA-BIA_LST',
+    'BIA-BIA_SMM','BIA-BIA_TBW'
+    # Add other relevant columns
+]).to_pandas().corr()
+
+sii_corr = corr_matrix['PCIAT-PCIAT_Total'].drop('PCIAT-PCIAT_Total')
+filtered_corr = sii_corr[(sii_corr > 0.1) | (sii_corr < -0.1)]
+
+print(filtered_corr)
+
+plt.figure(figsize=(8, 6))
+filtered_corr.sort_values().plot(kind='barh', color='coral')
+plt.title('Features with Correlation > 0.1 or < -0.1 with PCIAT-PCIAT_Total')
+plt.xlabel('Correlation coefficient')
+plt.ylabel('Features')
+plt.show()
+actigraphy = pl.read_parquet('/kaggle/input/child-mind-institute-problematic-internet-use/series_train.parquet/id=0417c91e/part-0.parquet')
+actigraphy
+def analyze_actigraphy(id, only_one_week=False, small=False):
+    actigraphy = pl.read_parquet(f'/kaggle/input/child-mind-institute-problematic-internet-use/series_train.parquet/id={id}/part-0.parquet')
+    day = actigraphy.get_column('relative_date_PCIAT') + actigraphy.get_column('time_of_day') / 86400e9
+    sample = train.filter(pl.col('id') == id)
+    age = sample.get_column('Basic_Demos-Age').item()
+    sex = ['boy', 'girl'][sample.get_column('Basic_Demos-Sex').item()]
+    actigraphy = (
+        actigraphy
+        .with_columns(
+            (day.diff() * 86400).alias('diff_seconds'),
+            (np.sqrt(np.square(pl.col('X')) + np.square(pl.col('Y')) + np.square(pl.col('Z'))).alias('norm'))
+        )
+    )
+
+    if only_one_week:
+        start = np.ceil(day.min())
+        mask = (start <= day.to_numpy()) & (day.to_numpy() <= start + 7*3)
+        mask &= ~ actigraphy.get_column('non-wear_flag').cast(bool).to_numpy()
+    else:
+        mask = np.full(len(day), True)
+        
+    if small:
+        timelines = [
+            ('enmo', 'forestgreen'),
+            ('light', 'orange'),
+        ]
+    else:
+        timelines = [
+            ('X', 'm'),
+            ('Y', 'm'),
+            ('Z', 'm'),
+#             ('norm', 'c'),
+            ('enmo', 'forestgreen'),
+            ('anglez', 'lightblue'),
+            ('light', 'orange'),
+            ('non-wear_flag', 'chocolate')
+    #         ('diff_seconds', 'k'),
+        ]
+        
+    _, axs = plt.subplots(len(timelines), 1, sharex=True, figsize=(12, len(timelines) * 1.1 + 0.5))
+    for ax, (feature, color) in zip(axs, timelines):
+        ax.set_facecolor('#eeeeee')
+        ax.scatter(day.to_numpy()[mask],
+                   actigraphy.get_column(feature).to_numpy()[mask],
+                   color=color, label=feature, s=1)
+        ax.legend(loc='upper left', facecolor='#eeeeee')
+        if feature == 'diff_seconds':
+            ax.set_ylim(-0.5, 20.5)
+    axs[-1].set_xlabel('day')
+    axs[-1].xaxis.set_major_locator(MaxNLocator(integer=True))
+    plt.tight_layout()
+    axs[0].set_title(f'id={id}, {sex}, age={age}')
+    plt.show()
+
+analyze_actigraphy('0417c91e', only_one_week=False)
+!pip -q install /kaggle/input/pytorchtabnet/pytorch_tabnet-4.1.0-py3-none-any.whl
+from pytorch_tabnet.tab_model import TabNetRegressor
+import torch
 SEED = 42
 n_splits = 5
 def process_file(filename, dirname):
@@ -376,11 +312,11 @@ def feature_engineering(df):
     df['DEE_Weight'] = df['BIA-BIA_DEE'] / df['Physical-Weight']
     df['SMM_Height'] = df['BIA-BIA_SMM'] / df['Physical-Height']
     df['Muscle_to_Fat'] = df['BIA-BIA_SMM'] / df['BIA-BIA_FMI']
-    df['Hydration_Status'] = df['BIA-BIA_TBW'] / df['Physical-Weight']
-    df['ICW_TBW'] = df['BIA-BIA_ICW'] / df['BIA-BIA_TBW']
-    df['BMI_PHR'] = df['Physical-BMI'] * df['Physical-HeartRate']
+
+
     
     return df
+
 train = pd.read_csv('/kaggle/input/child-mind-institute-problematic-internet-use/train.csv')
 test = pd.read_csv('/kaggle/input/child-mind-institute-problematic-internet-use/test.csv')
 sample = pd.read_csv('/kaggle/input/child-mind-institute-problematic-internet-use/sample_submission.csv')
@@ -401,7 +337,7 @@ test_ts_encoded['id']=test_ts["id"]
 train = pd.merge(train, train_ts_encoded, how="left", on='id')
 test = pd.merge(test, test_ts_encoded, how="left", on='id')
 
-imputer = KNNImputer(n_neighbors=5)
+imputer = KNNImputer(n_neighbors=71)
 numeric_cols = train.select_dtypes(include=['float64', 'int64']).columns
 imputed_data = imputer.fit_transform(train[numeric_cols])
 train_imputed = pd.DataFrame(imputed_data, columns=numeric_cols)
@@ -439,7 +375,7 @@ featuresCols = ['Basic_Demos-Age', 'Basic_Demos-Sex',
                 'SDS-SDS_Total_T',
                 'PreInt_EduHx-computerinternet_hoursday', 'sii', 'BMI_Age','Internet_Hours_Age','BMI_Internet_Hours',
                 'BFP_BMI', 'FFMI_BFP', 'FMI_BFP', 'LST_TBW', 'BFP_BMR', 'BFP_DEE', 'BMR_Weight', 'DEE_Weight',
-                'SMM_Height', 'Muscle_to_Fat', 'Hydration_Status', 'ICW_TBW','BMI_PHR']
+                'SMM_Height', 'Muscle_to_Fat']
 
 featuresCols += time_series_cols
 
@@ -465,7 +401,7 @@ featuresCols = ['Basic_Demos-Age', 'Basic_Demos-Sex',
                 'SDS-SDS_Total_T',
                 'PreInt_EduHx-computerinternet_hoursday', 'BMI_Age','Internet_Hours_Age','BMI_Internet_Hours',
                 'BFP_BMI', 'FFMI_BFP', 'FMI_BFP', 'LST_TBW', 'BFP_BMR', 'BFP_DEE', 'BMR_Weight', 'DEE_Weight',
-                'SMM_Height', 'Muscle_to_Fat', 'Hydration_Status', 'ICW_TBW','BMI_PHR']
+                'SMM_Height', 'Muscle_to_Fat']
 
 featuresCols += time_series_cols
 test = test[featuresCols]
@@ -483,6 +419,7 @@ def threshold_Rounder(oof_non_rounded, thresholds):
 def evaluate_predictions(thresholds, y_true, oof_non_rounded):
     rounded_p = threshold_Rounder(oof_non_rounded, thresholds)
     return -quadratic_weighted_kappa(y_true, rounded_p)
+
 def TrainML(model_class, test_data):
     X = train.drop(['sii'], axis=1)
     y = train['sii']
@@ -862,19 +799,17 @@ def TrainML(model_class, test_data):
     print(f"Mean Validation QWK ---> {np.mean(test_S):.4f}")
 
     KappaOPtimizer = minimize(evaluate_predictions,
-                              x0=[0.5, 1.49, 2.5], args=(y, oof_non_rounded), 
+                              x0=[0.5, 1.5, 2.5], args=(y, oof_non_rounded), 
                               method='Nelder-Mead')
     assert KappaOPtimizer.success, "Optimization did not converge."
-    thresholds = KappaOPtimizer.x
     
-    oof_tuned = threshold_Rounder(oof_non_rounded, thresholds)
+    oof_tuned = threshold_Rounder(oof_non_rounded, KappaOPtimizer.x)
     tKappa = quadratic_weighted_kappa(y, oof_tuned)
 
     print(f"----> || Optimized QWK SCORE :: {Fore.CYAN}{Style.BRIGHT} {tKappa:.3f}{Style.RESET_ALL}")
 
-    fold_weights = [1.25, 1.0, 1.0, 1.0, 1.0]
-    tpm = test_preds.dot(fold_weights) / np.sum(fold_weights)
-    tpTuned = threshold_Rounder(tpm, thresholds)
+    tpm = test_preds.mean(axis=1)
+    tpTuned = threshold_Rounder(tpm, KappaOPtimizer.x)
     
     submission = pd.DataFrame({
         'id': sample['id'],
@@ -1061,15 +996,14 @@ def TrainML(model_class, test_data):
                               x0=[0.5, 1.5, 2.5], args=(y, oof_non_rounded), 
                               method='Nelder-Mead')
     assert KappaOPtimizer.success, "Optimization did not converge."
-    thresholds = KappaOPtimizer.x
     
-    oof_tuned = threshold_Rounder(oof_non_rounded, thresholds)
+    oof_tuned = threshold_Rounder(oof_non_rounded, KappaOPtimizer.x)
     tKappa = quadratic_weighted_kappa(y, oof_tuned)
 
     print(f"----> || Optimized QWK SCORE :: {Fore.CYAN}{Style.BRIGHT} {tKappa:.3f}{Style.RESET_ALL}")
 
     tpm = test_preds.mean(axis=1)
-    tp_rounded = threshold_Rounder(tpm, thresholds)
+    tp_rounded = threshold_Rounder(tpm, KappaOPtimizer.x)
 
     return tp_rounded
 
@@ -1107,14 +1041,7 @@ combined = pd.DataFrame({
 })
 
 def majority_vote(row):
-    # Count occurrences of each value
-    counts = row.value_counts()
-    # Get the maximum count
-    max_count = counts.max()
-    # Filter the values that have the maximum count
-    majority_values = counts[counts == max_count].index
-    # Resolve ties by returning the smallest value (or any other rule you prefer)
-    return majority_values.min()
+    return row.mode()[0]
 
 combined['final_sii'] = combined[['sii_1', 'sii_2', 'sii_3']].apply(majority_vote, axis=1)
 
@@ -1123,4 +1050,3 @@ final_submission = combined[['id', 'final_sii']].rename(columns={'final_sii': 's
 final_submission.to_csv('submission.csv', index=False)
 
 print("Majority voting completed and saved to 'Final_Submission.csv'")
-
